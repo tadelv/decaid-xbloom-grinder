@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the changelog is built from the commits since the last tag.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify the tag matches manifest.version
+        run: |
+          version="$(jq -r '.version' xbloom-grinder.reaplugin/manifest.json)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "tag $GITHUB_REF_NAME does not match manifest.version $version" >&2
+            exit 1
+          fi
+
+      - name: Build the archive
+        run: ./scripts/package.sh
+
+      - name: Build the release notes
+        run: |
+          # `--generate-notes` lists merged pull requests, which is empty for
+          # commits pushed straight to main, so the changelog is built from the
+          # commit subjects since the previous tag instead. The licence and
+          # provenance footer is appended so every release carries both.
+          previous="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          {
+            echo "## What changed"
+            echo
+            if [ -n "$previous" ]; then
+              echo "Commits since \`$previous\`:"
+              echo
+              git log --no-merges --format='- %s' "$previous..$GITHUB_REF_NAME"
+            else
+              echo "First release."
+              echo
+              git log --no-merges --format='- %s' "$GITHUB_REF_NAME"
+            fi
+            echo
+            cat .github/release-notes-footer.md
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/xbloom-grinder.reaplugin-*.zip \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md"
