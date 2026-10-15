@@ -175,11 +175,11 @@ manifest disagree is rejected at install time.
 ## Tests
 
 `node scripts/check_plugin.mjs` runs offline — no Decaid, no hardware, no
-dependencies. It loads `plugin.js` against a fake BLE session and asserts the
-frames the driver writes byte-for-byte, the busy→idle host fallback, the
-published snapshot keys, the `skin` answer, the `ui` page's messages and REST
-sequencing through a stub DOM, the framing headers with and without an
-`Origin`, and the live view plus `changed` emit.
+dependencies. It loads `plugin.js` against a fake BLE session and validates the
+driver's BLE writes (against the observed device behavior), the busy→idle host
+fallback, the published snapshot keys, the `skin` answer, the `ui` page's
+messages and REST sequencing through a stub DOM, the framing headers with and
+without an `Origin`, and the live view plus `changed` emit.
 
 ## Verified
 
@@ -187,7 +187,8 @@ The protocol was exercised against a physical unit from the private development
 repo's Python reference client (macOS/CoreBluetooth, firmware
 `V12.0D.500`): connect, subscribe, set grind and rpm, START, the move-to-target
 tick, grind, and STOP, plus an autonomous hopper-empty stop. The JavaScript
-driver reproduces those captured frames, which `scripts/check_plugin.mjs` pins.
+driver implements the observed device behavior, which `scripts/check_plugin.mjs`
+verifies.
 
 The dashboard surfaces were exercised live against a running Decaid with a
 simulated machine and Streamline from `main` as the skin: the skin read the
