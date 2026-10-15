@@ -3,7 +3,7 @@
   "author": "tadelv",
   "name": "xBloom Studio Grinder",
   "description": "BLE grinder driver for the xBloom Studio: grind size, RPM, start/stop.",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "apiVersion": 1,
   "permissions": [
     "transport.ble",

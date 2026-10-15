@@ -1,6 +1,6 @@
 // Headless check for the xBloom grinder plugin: loads plugin.js with test
-// UUIDs, drives the handlers through a fake session, and asserts the emitted
-// frames match the observed device traffic byte-for-byte. No Decaid, no
+// UUIDs, drives the handlers through a fake session, and validates the
+// driver's BLE writes against the observed device behavior. No Decaid, no
 //
 // It also checks the Streamline dashboard surfaces: the `skin` answer, the
 // `ui` overlay page (through a stub DOM, so its messages and REST sequencing
@@ -217,7 +217,7 @@ await assert.rejects(() => handlers.start(), /not connected/);
   const manifest = JSON.parse(
     readFileSync(join(root, "xbloom-grinder.reaplugin/manifest.json"), "utf8"),
   );
-  assert.equal(manifest.version, "1.0.2", "manifest version bumped for the surfaces");
+  assert.equal(manifest.version, "1.0.3", "manifest version bumped for the surfaces");
   assert.ok(manifest.permissions.includes("api"), "api permission kept");
   assert.ok(manifest.permissions.includes("emit"), "emit permission declared");
   const endpoints = new Map(manifest.api.map((entry) => [entry.id, entry.type]));
@@ -655,4 +655,4 @@ await flush();
 bad.elementFor("close").click();
 assert.deepEqual(bad.assigned, ["/"], "a non-http returnTo is not followed");
 
-console.log("check_plugin: OK (frames match the captured device traffic)");
+console.log("check_plugin: OK (BLE writes match the observed device behavior)");

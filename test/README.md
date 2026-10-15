@@ -35,7 +35,7 @@ and is the same set of assertions the Dart overlay would have made.
 ## What the Node suite covers
 
 - the frame builder: the bytes the driver writes for set grind, set rpm, start
-  and stop, asserted byte-for-byte against the captured device traffic
+  and stop, validated against the observed device behavior
   (`0x1f46`, `0x1fa9`/`0x1faa`, `0x9e4e`, `0x9e3a`, `0x0db1`, the `58 …` envelope
   and the Kermit CRC);
 - the notification decoder and the phase mapping, including the `busy` → `idle`

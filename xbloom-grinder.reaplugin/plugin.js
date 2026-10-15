@@ -5,8 +5,8 @@
 //   58 <dir> <type> <cmd:u16-LE> <len> 00 00 00 <flag> <body> <crc16-LE>
 // CRC16 = Kermit (poly 0x1021, init 0x0000, reflected, no xorout).
 //
-// TODO(uuid): confirm these stay stable across firmware; captured from the
-// live device via scripts/x_grind.py (macOS/CoreBluetooth, firmware V12.0D.500).
+// TODO(uuid): confirm these stay stable across firmware; read from the
+// live device (macOS/CoreBluetooth, firmware V12.0D.500).
 // Any accepted BLE alias (16/32/128-bit) works; the host normalizes to 128-bit.
 const SERVICE_UUID = "0000e0ff-3c17-d293-8e48-14fe2e4da212"; // xBloom vendor service
 const WRITE_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"; //   write-without-response
