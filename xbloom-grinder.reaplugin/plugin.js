@@ -19,6 +19,8 @@ function createPlugin(host) {
   const GRIND_MAX = 80;
   const RPM_MIN = 60;
   const RPM_MAX = 120;
+  // The motor only resolves 10 rpm (60, 70, … 120).
+  const RPM_STEP = 10;
   const DEFAULT_GRIND = 50;
   const DEFAULT_RPM = 60;
 
@@ -47,10 +49,15 @@ function createPlugin(host) {
   }
 
   // Per-device defaults (grind + rpm), keyed by the runtime device id. The host
-  // namespaces storage to this plugin. host.storage answers through onEvent:
-  // reads resolve by key, writes resolve in FIFO order.
-  const pendingReads = new Map();
-  const pendingWrites = [];
+  // namespaces storage to this plugin, so keys stay bare: it forces the
+  // namespace to the plugin id and ignores any namespace sent here.
+  // host.storage answers through onEvent: reads resolve by key, writes resolve
+  // in FIFO order. Reads are queued per key, because connect() can load the
+  // stored defaults while a settings read hits the same key, and a single-slot
+  // map would strand the first caller. Writes are FIFO with a bounded wait to
+  // match the read path.
+  const pendingReads = new Map(); // key -> [{ resolve, timer }]
+  const pendingWrites = []; // [{ resolve, reject, timer }]
   const activeInstances = new Map();
 
   // The driver the host most recently created. The Streamline `rpm` line's
@@ -58,29 +65,56 @@ function createPlugin(host) {
   // time; a bound-but-offline driver answers with its own "not connected".
   let boundDriver = null;
 
+  // The device id of the most recent real binding, injected into the overlay so
+  // its Connect button can drive Decaid's device lifecycle.
+  let boundDeviceId = null;
+
+  // Mock grinder: a development switch that runs the real driver through a fake
+  // session, so the dashboard surfaces and the overlay can be exercised without
+  // hardware. Decaid ships no grinder simulator (only machine, scale, bengle,
+  // sensor and replay), so the simulation lives here. Off until switched on.
+  const MOCK_KEY = "mock";
+  const MOCK_DEVICE_ID = "xbloom-mock";
+  let mockOn = false;
+  let mockSession = null;
+  let mockDriver = null;
+  let realDriver = null;
+  let driverFactory = null;
+
   function storageRead(key) {
     if (typeof host.storage !== "function") return Promise.resolve(null);
     return new Promise(function (resolve) {
-      // A response dropped by a generation change must not stall connect, so
-      // the read resolves as null after a short bound.
-      const entry = {
-        resolve: resolve,
-        timer: setTimeout(function () {
-          if (pendingReads.get(key) === entry) {
-            pendingReads.delete(key);
-            resolve(null);
-          }
-        }, 2000)
-      };
-      pendingReads.set(key, entry);
+      const entry = { resolve: resolve, timer: null };
+      // A response dropped by a generation change must not stall connect, so a
+      // stuck waiter resolves as null after a short bound and leaves the queue.
+      entry.timer = setTimeout(function () {
+        const waiters = pendingReads.get(key);
+        if (!waiters) return;
+        const index = waiters.indexOf(entry);
+        if (index >= 0) waiters.splice(index, 1);
+        if (waiters.length === 0) pendingReads.delete(key);
+        resolve(null);
+      }, 2000);
+      const waiters = pendingReads.get(key);
+      if (waiters) waiters.push(entry);
+      else pendingReads.set(key, [entry]);
       host.storage({ type: "read", key: key });
     });
   }
 
   function storageWrite(key, value) {
     if (typeof host.storage !== "function") return Promise.resolve();
-    return new Promise(function (resolve) {
-      pendingWrites.push(resolve);
+    return new Promise(function (resolve, reject) {
+      // Bounded like the read path: a dropped confirmation must not hang a
+      // settings POST forever. It is reported as a failure rather than
+      // silently claimed as saved.
+      const entry = { resolve: resolve, reject: reject, timer: null };
+      entry.timer = setTimeout(function () {
+        const index = pendingWrites.indexOf(entry);
+        if (index >= 0) pendingWrites.splice(index, 1);
+        reject(new Error("storage write timed out"));
+      }, 2000);
+      pendingWrites.push(entry);
       host.storage({ type: "write", key: key, data: value });
     });
   }
@@ -97,7 +131,8 @@ function createPlugin(host) {
     const grind = Number(parsed && parsed.grind);
     const rpm = Number(parsed && parsed.rpm);
     if (!Number.isInteger(grind) || grind < GRIND_MIN || grind > GRIND_MAX) return null;
-    if (!Number.isInteger(rpm) || rpm < RPM_MIN || rpm > RPM_MAX) return null;
+    if (!Number.isInteger(rpm) || rpm < RPM_MIN || rpm > RPM_MAX ||
+        (rpm - RPM_MIN) % RPM_STEP !== 0) return null;
     return { grind: grind, rpm: rpm };
   }
 
@@ -166,16 +201,28 @@ function createPlugin(host) {
           }
         },
         {
-          id: "stepsize",
+          id: "grind-set",
           kind: "tile-hint",
           tile: "grind",
-          // The skin draws the pill text itself (from the size stored on the
-          // device); the spec still requires some text. Whole numbers only:
-          // grindSetting is an integer control (1..80, step 1) and a fractional
-          // size would both render the tile with a decimal and be rejected by
-          // the driver's own integer guard, which reads as a glitch.
-          text: "Step",
-          action: { type: "stepsize", field: "grinderSetting", sizes: [1, 5] }
+          // Streamline's own Grind value is only recorded with the shot; it does
+          // not command the grinder. A `call` is the one skin action that runs
+          // plugin code, so the grind pill opens the numpad and sends the value
+          // to the device through `set-grind`.
+          text: "Grind " + live.grind,
+          title: "Set the xBloom grind size",
+          action: {
+            type: "call",
+            endpoint: "set-grind",
+            field: "setting",
+            input: {
+              title: "Grind",
+              unit: "",
+              min: GRIND_MIN,
+              max: GRIND_MAX,
+              decimals: 0,
+              value: live.grind
+            }
+          }
         },
         {
           id: "grinder",
@@ -233,7 +280,7 @@ function createPlugin(host) {
       "<label for=\"grind\">Default grind</label>" +
       "<input id=\"grind\" type=\"number\" min=\"" + GRIND_MIN + "\" max=\"" + GRIND_MAX + "\" step=\"1\" value=\"" + grind + "\">" +
       "<label for=\"rpm\">Default RPM</label>" +
-      "<input id=\"rpm\" type=\"number\" min=\"" + RPM_MIN + "\" max=\"" + RPM_MAX + "\" step=\"1\" value=\"" + rpm + "\">" +
+      "<input id=\"rpm\" type=\"number\" min=\"" + RPM_MIN + "\" max=\"" + RPM_MAX + "\" step=\"10\" value=\"" + rpm + "\">" +
       "<button id=\"save\">Save</button><div id=\"status\"></div><script>" +
       "document.getElementById('save').addEventListener('click',function(){" +
       "var status=document.getElementById('status');" +
@@ -264,10 +311,11 @@ function createPlugin(host) {
       const grind = Number(body.grind);
       const rpm = Number(body.rpm);
       if (!Number.isInteger(grind) || grind < GRIND_MIN || grind > GRIND_MAX ||
-          !Number.isInteger(rpm) || rpm < RPM_MIN || rpm > RPM_MAX) {
+          !Number.isInteger(rpm) || rpm < RPM_MIN || rpm > RPM_MAX ||
+          (rpm - RPM_MIN) % RPM_STEP !== 0) {
         return jsonResponse(400, {
           error: "grind must be " + GRIND_MIN + ".." + GRIND_MAX +
-            " and rpm " + RPM_MIN + ".." + RPM_MAX
+            " and rpm " + RPM_MIN + ".." + RPM_MAX + " in steps of " + RPM_STEP
         });
       }
       await storageWrite(deviceId, JSON.stringify({ grind: grind, rpm: rpm }));
@@ -291,11 +339,13 @@ function createPlugin(host) {
   }
 
   // The `ui` page the header button opens: an overlay over the dashboard
-  // (`embed=1&theme=…`), or a page with `returnTo`. It drives Decaid's
-  // same-origin /api/v1/grinder REST surface directly. `fit: true` makes the
-  // dialog transparent, so the page draws its own card on a transparent
-  // html/body and reports its size to the skin.
-  function renderControlPage(theme) {
+  // (`embed=1&theme=…`), or a page with `returnTo`. It drives the plugin's own
+  // endpoints (`state`, `set-grind`, `rpm`, `start`, `stop`, `mock`) rather than
+  // Decaid's grinder REST, so it also works with the mock grinder; its Connect
+  // button drives Decaid's device lifecycle. `fit: true` makes the dialog
+  // transparent, so the page draws its own card on a transparent html/body and
+  // reports its size to the skin.
+  function renderControlPage(theme, deviceId) {
     return "<!DOCTYPE html><html lang=\"en\" data-theme=\"" +
       (theme === "dark" ? "dark" : "light") + "\"><head><meta charset=\"utf-8\">" +
       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
@@ -315,48 +365,63 @@ function createPlugin(host) {
       "button{flex:1;padding:.6rem 1rem;font-size:1rem;border:0;border-radius:8px;" +
       "background:var(--accent);color:#fff}" +
       "button.ghost{flex:0 0 auto;background:transparent;color:var(--muted);border:1px solid var(--line)}" +
+      "button:disabled{opacity:.5}" +
       "#note{color:var(--muted);font-size:.85rem}" +
       "</style></head><body><div id=\"card\"><h1>xBloom grinder</h1>" +
       "<p id=\"state\">Loading\u2026</p>" +
       "<label for=\"grind\">Grind (" + GRIND_MIN + "\u2013" + GRIND_MAX + ")</label>" +
       "<input id=\"grind\" type=\"number\" min=\"" + GRIND_MIN + "\" max=\"" + GRIND_MAX + "\" step=\"1\">" +
       "<label for=\"rpm\">RPM (" + RPM_MIN + "\u2013" + RPM_MAX + ")</label>" +
-      "<input id=\"rpm\" type=\"number\" min=\"" + RPM_MIN + "\" max=\"" + RPM_MAX + "\" step=\"1\">" +
-      "<div class=\"row\"><button id=\"start\">Start</button><button id=\"stop\">Stop</button></div>" +
+      "<input id=\"rpm\" type=\"number\" min=\"" + RPM_MIN + "\" max=\"" + RPM_MAX + "\" step=\"10\">" +
+      "<div class=\"row\"><button id=\"apply\">Apply</button></div>" +
+      "<div class=\"row\"><button id=\"connect\" class=\"ghost\">Connect</button>" +
+      "<button id=\"mock\" class=\"ghost\">Mock off</button></div>" +
       "<div class=\"row\"><button id=\"close\" class=\"ghost\">Close</button><span id=\"note\"></span></div>" +
       "</div><script>" +
       "(function(){" +
       "var view=null;" +
+      "var deviceId=" + JSON.stringify(String(deviceId || "")) + ";" +
       "var params=new URLSearchParams(location.search);" +
       "var embedded=params.get('embed')==='1';" +
       "function $(id){return document.getElementById(id);}" +
       "function post(message){try{window.parent.postMessage(message,'*');}catch(error){}}" +
       "function note(text){$('note').textContent=text||'';}" +
-      "function paint(){" +
-      "if(!view){$('state').textContent='Grinder offline';return;}" +
-      "$('state').textContent=view.state+' \u00b7 grind '+view.setting+' \u00b7 '+view.rpm+' rpm';}" +
-      "function put(url,body){var init={method:'PUT'};" +
+      "function api(name,body){var init={method:'POST'};" +
       "if(body!==undefined){init.headers={'Content-Type':'application/json'};" +
       "init.body=JSON.stringify(body);}" +
-      "return fetch(url,init).then(function(response){" +
-      "if(!response.ok)throw new Error('HTTP '+response.status);return response;});}" +
-      // START is what moves the burr on this device, so grind and rpm are
-      // stored first and only then is grinding requested.
-      "function apply(){" +
-      "var grind=Number($('grind').value);var rpm=Number($('rpm').value);" +
-      "return put('/api/v1/grinder/setting',{setting:String(grind)}).then(function(){" +
-      "return put('/api/v1/grinder/rpm',{rpm:rpm});});}" +
-      "function load(){return fetch('/api/v1/grinder/state').then(function(response){" +
+      "return fetch(name,init).then(function(response){return response.text().then(function(text){" +
+      "var data=null;try{data=text?JSON.parse(text):null;}catch(error){}" +
+      "if(!response.ok)throw new Error((data&&data.error)||('HTTP '+response.status));" +
+      "return data;});});}" +
+      "function paint(){" +
+      "if(!view){$('state').textContent='Grinder offline';}" +
+      "else{$('state').textContent=(view.mock?'MOCK \u00b7 ':'')+view.state+' \u00b7 grind '+view.setting+' \u00b7 '+view.rpm+' rpm';}" +
+      "$('connect').textContent=(view&&view.connected)?'Disconnect':'Connect';" +
+      "$('connect').disabled=!deviceId;" +
+      "$('mock').textContent=(view&&view.mock)?'Mock on':'Mock off';}" +
+      "function load(){return fetch('state').then(function(response){" +
       "return response.ok?response.json():null;}).then(function(body){" +
       "if(!body){view=null;paint();return;}" +
-      "view=body;$('grind').value=body.setting;$('rpm').value=body.rpm;paint();note('');" +
+      "view=body;$('grind').value=body.setting;$('rpm').value=body.rpm;paint();" +
       "}).catch(function(){view=null;paint();});}" +
-      "$('start').addEventListener('click',function(){note('Starting\u2026');" +
-      "apply().then(function(){return put('/api/v1/grinder/state/grinding');})" +
-      ".then(load).catch(function(){note('Could not start');});});" +
-      "$('stop').addEventListener('click',function(){note('Stopping\u2026');" +
-      "put('/api/v1/grinder/state/idle').then(load)" +
-      ".catch(function(){note('Could not stop');});});" +
+      // Apply sends both values to the grinder; the grinder is started on the
+      // machine itself.
+      "function apply(){var grind=Number($('grind').value);var rpm=Number($('rpm').value);" +
+      "return api('set-grind',{setting:grind}).then(function(){return api('rpm',{rpm:rpm});});}" +
+      "$('apply').addEventListener('click',function(){note('Applying\u2026');" +
+      "apply().then(load).then(function(){note('Applied');})" +
+      ".catch(function(error){note(error.message||'Could not apply');});});" +
+      "$('connect').addEventListener('click',function(){" +
+      "if(!deviceId){note('Pair the grinder in Decaid first');return;}" +
+      "var path=(view&&view.connected)?'disconnect':'connect';" +
+      "note(path==='connect'?'Connecting\u2026':'Disconnecting\u2026');" +
+      "fetch('/api/v1/devices/'+path,{method:'PUT',headers:{'Content-Type':'application/json'}," +
+      "body:JSON.stringify({deviceId:deviceId})}).then(function(response){" +
+      "if(!response.ok)throw new Error('HTTP '+response.status);return load();})" +
+      ".then(function(){note('');}).catch(function(error){note(error.message||'Could not connect');});});" +
+      "$('mock').addEventListener('click',function(){" +
+      "api('mock',{on:!(view&&view.mock)}).then(load)" +
+      ".catch(function(error){note(error.message||'Could not toggle the mock');});});" +
       "$('close').addEventListener('click',function(){" +
       "if(embedded){post({type:'streamline:close'});return;}" +
       "var raw=params.get('returnTo');var target=null;" +
@@ -385,11 +450,13 @@ function createPlugin(host) {
     if (request.method !== "POST") {
       return jsonResponse(405, { error: "POST required" });
     }
-    const value = Number((request.body || {}).rpm);
-    if (!Number.isInteger(value) || value < RPM_MIN || value > RPM_MAX) {
-      return jsonResponse(400, {
-        error: "rpm must be an integer " + RPM_MIN + ".." + RPM_MAX
-      });
+    let value;
+    try {
+      // One copy of the 60..120 rule (parseRpm), so the endpoint and the
+      // driver cannot drift apart.
+      value = parseRpm((request.body || {}).rpm);
+    } catch (error) {
+      return jsonResponse(400, { error: error.message });
     }
     if (!boundDriver) {
       return jsonResponse(503, { error: "No xBloom grinder is connected" });
@@ -405,6 +472,51 @@ function createPlugin(host) {
     return jsonResponse(200, { rpm: value });
   }
 
+  // The in-memory view the overlay reads: it needs no host device, so it works
+  // with the mock grinder too.
+  function liveState() {
+    return {
+      connected: live.connected,
+      state: live.phase,
+      setting: String(live.grind),
+      rpm: live.rpm,
+      mock: mockOn
+    };
+  }
+
+  async function handleSetGrind(request) {
+    if (request.method !== "POST") return jsonResponse(405, { error: "POST required" });
+    let setting;
+    try {
+      setting = parseGrind((request.body || {}).setting);
+    } catch (error) {
+      return jsonResponse(400, { error: error.message });
+    }
+    if (!boundDriver) {
+      return jsonResponse(503, { error: "No xBloom grinder is connected" });
+    }
+    try {
+      await boundDriver.setGrindSetting(setting);
+    } catch (error) {
+      return jsonResponse(503, {
+        error: (error && error.message) || "Could not set the grind"
+      });
+    }
+    return jsonResponse(200, { setting: setting });
+  }
+
+  async function handleMock(request) {
+    if (request.method !== "POST") return jsonResponse(405, { error: "POST required" });
+    try {
+      await setMock(!!(request.body || {}).on);
+    } catch (error) {
+      return jsonResponse(503, {
+        error: (error && error.message) || "Could not toggle the mock grinder"
+      });
+    }
+    return jsonResponse(200, { mock: mockOn });
+  }
+
   // Decaid adds X-Frame-Options: SAMEORIGIN to every plugin page, so a skin on
   // another origin is refused in the overlay. Answering with frame-ancestors
   // for the skin's origin (from Origin, else Referer) makes browsers ignore it.
@@ -418,7 +530,7 @@ function createPlugin(host) {
     return {
       status: 200,
       headers: headers,
-      body: renderControlPage((request.query || {}).theme)
+      body: renderControlPage((request.query || {}).theme, boundDeviceId)
     };
   }
 
@@ -465,11 +577,65 @@ function createPlugin(host) {
   function frameSet(grind, rpm) {
     return buildFrame(0x1f46, u32le(grind).concat(u32le(rpm)));
   }
-  function frameStart(grind, rpm) {
-    return buildFrame(0x0dac, u32le(0x03e8).concat(u32le(grind), u32le(rpm)));
+
+  // --- Mock grinder --------------------------------------------------------
+  // A connected grinder that accepts configuration and reports it back. It
+  // sends no notifications, because the plugin no longer starts or stops the
+  // device (the grinder is started on the machine itself).
+  function makeMockSession() {
+    return {
+      gatt: {
+        discoverServices: async function () { return [SERVICE_UUID]; },
+        onDisconnect: function () {},
+        subscribe: async function () { return { unsubscribe: async function () {} }; },
+        writeWithoutResponse: async function () {}
+      },
+      publish: async function () {},
+      reportDisconnected: async function () {},
+      close: function () {}
+    };
   }
-  function frameStop() {
-    return buildFrame(0x0db1, []);
+
+  async function startMock() {
+    if (mockOn) return;
+    if (!driverFactory) throw new Error("grinder driver is not ready");
+    mockOn = true;
+    const driver = driverFactory.create({ id: MOCK_DEVICE_ID, name: "XBLOOM mock" });
+    const session = makeMockSession();
+    mockSession = session;
+    mockDriver = driver;
+    await driver.connect(session);
+    log("mock grinder connected (no hardware)");
+  }
+
+  function stopMock() {
+    if (!mockOn) return;
+    mockOn = false;
+    if (mockSession) { mockSession.close(); mockSession = null; }
+    // Disconnect the mock driver itself (not whatever boundDriver points at
+    // now), then hand the endpoints back to the real driver so a mock cycle
+    // does not leave the plugin talking to a retired mock.
+    if (mockDriver) {
+      try { mockDriver.disconnect(); } catch (error) { /* already gone */ }
+      mockDriver = null;
+    }
+    boundDriver = realDriver;
+    // The mock's disconnect() moved the shared view offline; put it back to
+    // whatever the real driver actually is.
+    if (realDriver && typeof realDriver.describe === "function") {
+      updateLive(realDriver.describe());
+    } else {
+      updateLive({ connected: false });
+    }
+    log("mock grinder disconnected");
+  }
+
+  async function setMock(on) {
+    if (on === mockOn) return mockOn;
+    await storageWrite(MOCK_KEY, on ? "1" : "0");
+    if (on) await startMock();
+    else stopMock();
+    return mockOn;
   }
 
   function toHex(bytes) {
@@ -504,8 +670,11 @@ function createPlugin(host) {
   // commands the same way, this guard covers direct handler calls.
   function parseRpm(rpm) {
     const value = Number(rpm);
-    if (!Number.isInteger(value) || value < RPM_MIN || value > RPM_MAX) {
-      throw new Error("rpm must be an integer " + RPM_MIN + ".." + RPM_MAX);
+    if (!Number.isInteger(value) || value < RPM_MIN || value > RPM_MAX ||
+        (value - RPM_MIN) % RPM_STEP !== 0) {
+      throw new Error(
+        "rpm must be " + RPM_MIN + ".." + RPM_MAX + " in steps of " + RPM_STEP
+      );
     }
     return value;
   }
@@ -513,11 +682,15 @@ function createPlugin(host) {
   return {
     id: "xbloom-grinder.reaplugin",
 
-    onLoad() {
-      return host.devices.bindDriver("xbloom", {
+    onLoad(settings) {
+      driverFactory = {
         create(device) {
           const deviceId =
             device && typeof device.id === "string" ? device.id : null;
+          const isMock = deviceId === MOCK_DEVICE_ID;
+          // The overlay's Connect button targets the real device; a mock
+          // binding must not overwrite it.
+          if (deviceId && !isMock) boundDeviceId = deviceId;
           // Survives reconnects for the life of this binding. Last values the
           // host set are re-sent as one combined 0x1f46 frame per setter.
           let lastGrind = DEFAULT_GRIND;
@@ -544,8 +717,13 @@ function createPlugin(host) {
                 lastRpm = rpm;
                 updateLive({ grind: grind, rpm: rpm });
                 if (active && !active.stopped) {
-                  return active.session
-                    .publish(snapshot(active, active.phase))
+                  const state = active;
+                  // Send the new target as well, so a saved default is applied
+                  // to the grinder instead of only published to Decaid.
+                  return write(state, frameSet(grind, rpm))
+                    .then(function () {
+                      return state.session.publish(snapshot(state, state.phase));
+                    })
                     .catch(function () {});
                 }
                 return Promise.resolve();
@@ -657,7 +835,10 @@ function createPlugin(host) {
               await loadDefaults();
 
               const services = await session.gatt.discoverServices();
-              if (services.indexOf(normalizeUuid(SERVICE_UUID)) < 0) {
+              const wanted = normalizeUuid(SERVICE_UUID);
+              // The host may report short-form or upper-case UUIDs, so both
+              // sides are normalized before the match.
+              if (!services.some((uuid) => normalizeUuid(uuid) === wanted)) {
                 throw new Error("xBloom vendor service unavailable");
               }
               session.gatt.onDisconnect(() => {
@@ -686,45 +867,70 @@ function createPlugin(host) {
               updateLive({ connected: false });
             },
 
-            async start() {
-              const state = requireActive();
-              await write(state, frameStart(lastGrind, lastRpm));
-              // Moving to target; the reach/grind-start frames flip to "grinding".
-              setPhase(state, "busy");
-            },
-
-            async stop() {
-              const state = requireActive();
-              await write(state, frameStop());
-              setPhase(state, "idle");
-            },
+            // start()/stop() are intentionally not wired up: the START frame
+            // did not physically start the grinder, so `startStop` is no longer
+            // declared and the plugin only configures grind and rpm.
 
             async setGrindSetting(setting) {
               const state = requireActive();
-              lastGrind = parseGrind(setting);
+              const grind = parseGrind(setting);
               // Stores the target only — the xBloom does not move to the
-              // requested grind/rpm until start().
-              await write(state, frameSet(lastGrind, lastRpm));
+              // requested grind/rpm until start(). The value is committed (and
+              // the live view moved) only after the write lands, so a failed
+              // write cannot leave memory advertising an un-applied target.
+              await write(state, frameSet(grind, lastRpm));
+              lastGrind = grind;
               await state.session.publish(snapshot(state, state.phase));
               updateLive({ grind: lastGrind });
             },
 
             async setRpm(rpm) {
               const state = requireActive();
-              lastRpm = parseRpm(rpm);
+              const value = parseRpm(rpm);
               // See setGrindSetting: configure only, no movement.
-              await write(state, frameSet(lastGrind, lastRpm));
+              await write(state, frameSet(lastGrind, value));
+              lastRpm = value;
               await state.session.publish(snapshot(state, state.phase));
               updateLive({ rpm: lastRpm });
+            },
+
+            // The driver's own view, so the plugin can restore `live` from the
+            // real driver after a mock cycle.
+            describe() {
+              return {
+                connected: !!(active && !active.stopped),
+                phase: active ? active.phase : "idle",
+                grind: lastGrind,
+                rpm: lastRpm
+              };
             }
           };
           // The `rpm` endpoint posts without a device id; the newest binding
           // owns it, and its setRpm is the same path the host's control setter
           // takes.
+          // A real binding becomes the default driver again and supersedes a
+          // running mock, so the two cannot fight over the live view.
+          if (!isMock) {
+            realDriver = driver;
+            if (mockOn) stopMock();
+          }
           boundDriver = driver;
           return driver;
         }
-      });
+      };
+      const binding = host.devices.bindDriver("xbloom", driverFactory);
+      // Restore a persisted mock, or the manifest setting on first boot. Never
+      // let it block or fail the load.
+      Promise.resolve(binding)
+        .then(function () { return storageRead(MOCK_KEY); })
+        .then(function (stored) {
+          const on = stored === null || stored === undefined
+            ? !!(settings && settings.MockGrinder)
+            : stored === "1" || stored === true;
+          if (on) return startMock();
+        })
+        .catch(function (error) { log("mock restore skipped: " + error); });
+      return binding;
     },
 
     // Serves the driver's `settings` surface, the Streamline `skin` answer and
@@ -734,8 +940,11 @@ function createPlugin(host) {
     __httpRequestHandler(request) {
       if (!request) return jsonResponse(404, { error: "Unknown endpoint" });
       if (request.endpoint === "skin") return jsonResponse(200, skinAnswer());
+      if (request.endpoint === "state") return jsonResponse(200, liveState());
       if (request.endpoint === "ui") return handleUi(request);
       if (request.endpoint === "rpm") return handleRpm(request);
+      if (request.endpoint === "set-grind") return handleSetGrind(request);
+      if (request.endpoint === "mock") return handleMock(request);
       if (request.endpoint === "device-settings") return handleDeviceSettings(request);
       return jsonResponse(404, { error: "Unknown endpoint" });
     },
@@ -744,23 +953,38 @@ function createPlugin(host) {
       if (!event || typeof event.name !== "string") return;
       const payload = event.payload || {};
       if (event.name === "storageRead") {
-        const entry = pendingReads.get(payload.key);
-        if (entry) {
+        const waiters = pendingReads.get(payload.key);
+        if (waiters) {
           pendingReads.delete(payload.key);
-          clearTimeout(entry.timer);
-          entry.resolve(payload.value);
+          for (const entry of waiters) {
+            clearTimeout(entry.timer);
+            entry.resolve(payload.value);
+          }
         }
       } else if (event.name === "storageWrite") {
-        const resolve = pendingWrites.shift();
-        if (resolve) resolve();
+        const entry = pendingWrites.shift();
+        if (entry) {
+          clearTimeout(entry.timer);
+          entry.resolve();
+        }
       }
     },
 
-    // Host retires any live BLE session on unload; clear plugin-level requests.
+    // Host retires any live BLE session on unload; settle and clear plugin
+    // requests so an in-flight connect() or settings POST cannot hang across a
+    // reload.
     onUnload() {
-      for (const entry of pendingReads.values()) clearTimeout(entry.timer);
+      for (const waiters of pendingReads.values()) {
+        for (const entry of waiters) {
+          clearTimeout(entry.timer);
+          entry.resolve(null);
+        }
+      }
       pendingReads.clear();
-      pendingWrites.length = 0;
+      for (const entry of pendingWrites.splice(0)) {
+        clearTimeout(entry.timer);
+        entry.resolve();
+      }
       activeInstances.clear();
       boundDriver = null;
     }

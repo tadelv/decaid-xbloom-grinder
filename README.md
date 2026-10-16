@@ -18,9 +18,11 @@ repository.
 
 ## Driver type
 
-The plugin declares the `grinder` driver type with three capabilities:
-`startStop`, `grindSetting` and `rpmControl`. It publishes `state`, `setting`
-and `rpm` as its snapshot, and Decaid exposes it through the singular
+The plugin declares the `grinder` driver type with two capabilities,
+`grindSetting` and `rpmControl` — it configures the grinder but does not start
+or stop it (`startStop` is not declared: the START frame did not physically
+start the device). It publishes `state`, `setting` and `rpm` as its snapshot,
+and Decaid exposes it through the singular
 `/api/v1/grinder/*` REST surface and `/ws/v1/grinder/snapshot`.
 
 Declared controls:
@@ -28,8 +30,7 @@ Declared controls:
 | Capability | Handler | Control |
 | --- | --- | --- |
 | `grindSetting` | `setGrindSetting(setting)` | numeric 1–80, step 1 |
-| `rpmControl` | `setRpm(rpm)` | numeric 60–120, step 1 |
-| `startStop` | `start()` / `stop()` | — |
+| `rpmControl` | `setRpm(rpm)` | numeric 60–120, step 10 |
 
 ## Install
 
@@ -42,6 +43,15 @@ curl -X POST http://localhost:8080/api/v1/plugins/install/github-release \
 ```
 
 Or open the Plugins settings screen in Decaid and install from the repository.
+
+### After installing or updating
+
+Decaid drops the plugin's BLE session when it loads a new source, so the grinder
+comes back in `discovered` state. **Reconnect it** (Decaid's device management,
+or the overlay's Connect button) before controlling it. A control command sent
+while Decaid shows the grinder connected but the plugin has no live session hangs
+until the host's 10 s invocation timeout, which Decaid treats as a protocol
+failure and disconnects the device.
 
 The driver itself needs no particular Decaid release. See
 [Dashboard surfaces](#dashboard-surfaces) for the one optional extra that does
@@ -65,15 +75,18 @@ The driver publishes `{state, setting, rpm}`:
 
 | Field | Source | Mapping |
 | --- | --- | --- |
-| `state` | device notifications | `busy` while the burr moves to the target, `grinding` once grinding starts, `idle` when stopped or at rest |
+| `state` | device notifications | `busy` while the burr moves, `grinding` once grinding starts, `idle` when stopped or at rest — the plugin reports the device's state, it does not drive it |
 | `setting` | last set or stored default | integer, requires `grindSetting` |
 | `rpm` | last set or stored default | integer, requires `rpmControl` |
 
-The move-to-target phase publishes `busy`. That state needs the host change in
-the private development repo's `decaid-grinder-busy-state.patch` (it adds `busy`
-to `GrinderState`, the OpenAPI enum, the docs and a test). Without it the host
-rejects `busy`, and the plugin falls back to `idle` automatically — so the
-driver works on stock Decaid either way.
+The plugin does not start or stop the grinder (`startStop` is not declared — the
+START frame did not start the device). `busy` therefore only appears while the
+device reports motion, for example a grind started on the machine itself. That
+state needs the host change in the private development repo's
+`decaid-grinder-busy-state.patch` (it adds `busy` to `GrinderState`, the OpenAPI
+enum, the docs and a test). Without it the host rejects `busy`, and the plugin
+falls back to `idle` automatically — so the driver works on stock Decaid either
+way.
 
 ## Controls
 
@@ -100,7 +113,7 @@ surfaces:
 | Surface | Kind | Where | Shows |
 | --- | --- | --- | --- |
 | `rpm` | `tile-line` | under the Grind label | the current RPM (`90 rpm`), drawn switched on while the grinder is not idle; a tap opens the skin's own numpad and sets it |
-| `stepsize` | `tile-hint` | the Grind tile's pill | a `1 / 5` step for Decaid's own `-`/`+`, chosen by the user |
+| `grind-set` | `tile-hint` | the Grind tile's pill | the current grind (`Grind 45`); a tap opens the skin's own numpad and sets the grinder's grind |
 | `grinder` | `header-button` | the dashboard header | "Grinder" plus the current grind and RPM, or that it is offline; opens a control overlay |
 
 **The RPM line is also the control**, in the slot it already occupies: no second
@@ -113,11 +126,13 @@ can POST there — and answers only after the value has landed, so the skin's
 follow-up `skin` read shows the truth. With no grinder bound or connected it
 answers `503` rather than hanging.
 
-The pill carries a `text` because the spec requires one; the skin draws the pill
-label itself from the size the user picked on that device. Both sizes are whole
-numbers because `grindSetting` is an integer control (1–80, step 1): a
-fractional size would draw the tile with a decimal and then be rejected by the
-driver's own guard, which reads as a glitch.
+**Why a `call` pill, not a `tile-mode` or `stepsize`.** Streamline's own Grind
+value is only recorded with the shot — it does **not** command the grinder — so
+Decaid's `-`/`+` and a `stepsize` never reach the device. A `call` is the one
+skin action that runs plugin code, so the grind pill is the control. A
+`tile-mode` would command the device as well, but a mode owns the tile's value
+and replaces a `tile-line` on the same tile (both use the space under the
+label), which would hide the RPM line, so the pill is used instead.
 
 **The `skin` answer never blocks and never needs the grinder.** It is built from
 an in-memory view (connected, phase, grind, rpm), so it renders — reporting the
@@ -125,10 +140,14 @@ grinder offline — before any device binds, and the skin's 2 s budget is never 
 risk.
 
 The `ui` endpoint serves the overlay the header button opens. It reports its
-size to the skin, drives Decaid's same-origin `/api/v1/grinder/*` REST surface,
-stores grind and RPM before starting (because START is what moves the burr here),
-and renders in both the `light` and `dark` themes the skin passes. Decaid stamps
-`X-Frame-Options: SAMEORIGIN` on plugin pages, so the `ui` response answers with
+size to the skin, drives the plugin's own endpoints (`state`, `set-grind`,
+`rpm`) rather than Decaid's grinder REST — so it works with the mock grinder too
+— has an **Apply** button that sends grind and RPM to the grinder without
+starting it, and renders in both the `light` and `dark` themes the skin
+passes. Its **Connect** button drives Decaid's device lifecycle
+(`PUT /api/v1/devices/connect` / `disconnect`), and its **Mock** button toggles
+the mock grinder (below). Decaid stamps `X-Frame-Options: SAMEORIGIN` on plugin
+pages, so the `ui` response answers with
 `Content-Security-Policy: frame-ancestors 'self' <skin origin>` when the request
 carries an `Origin` or `Referer` header; the host is validated, not reflected.
 
@@ -144,6 +163,25 @@ applies.
 
 `host.emit` is guarded with a `typeof` check, so the offline harness keeps
 working without it.
+
+## Mock grinder and Connect
+
+Two development affordances, both off by default.
+
+**Mock grinder.** A toggle (the overlay's **Mock** button, or the `MockGrinder`
+manifest setting) makes the plugin connect a fake session that answers the real
+protocol frames — a START moves the burr, reaches the target, then grinds — so
+the driver's own logic runs unchanged and the dashboard surfaces and the overlay
+show a connected, controllable grinder with no hardware. Decaid ships no grinder
+simulator (only machine, scale, bengle, sensor and replay), so the simulation
+lives in the plugin; Decaid's own grinder device stays disconnected while it is
+on. The choice is persisted, so it survives a reload, and the surfaces and the
+overlay mark it `MOCK`.
+
+**Connect.** The overlay's Connect button calls Decaid's
+`PUT /api/v1/devices/connect` (or `disconnect`) for the bound grinder, so a
+paired-but-dropped grinder can be brought back without leaving the dashboard. It
+is disabled until a device has been bound.
 
 ## Device surface
 
@@ -178,8 +216,10 @@ manifest disagree is rejected at install time.
 dependencies. It loads `plugin.js` against a fake BLE session and validates the
 driver's BLE writes (against the observed device behavior), the busy→idle host
 fallback, the published snapshot keys, the `skin` answer, the `ui` page's
-messages and REST sequencing through a stub DOM, the framing headers with and
-without an `Origin`, and the live view plus `changed` emit.
+messages and endpoint sequencing through a stub DOM, the framing headers with and
+without an `Origin`, and the live view plus `changed` emit. It also covers the
+per-key storage-read queue and the write/unload settling, and the mock grinder
+end to end.
 
 ## Verified
 

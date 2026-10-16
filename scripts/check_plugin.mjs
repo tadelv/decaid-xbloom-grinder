@@ -88,13 +88,10 @@ assert.deepEqual(published.at(-1), { state: "idle", setting: "50", rpm: 60 });
 await handlers.setRpm(60);
 assert.equal(writes.at(-1), "580101461f1400000001320000003c0000000403", "set frame (rpm)");
 
-await handlers.start();
-assert.equal(writes.at(-1), "580101ac0d1800000001e8030000320000003c00000018cf", "start frame");
-assert.equal(published.at(-1).state, "busy", "start → moving (not grinding yet)");
-
-await handlers.stop();
-assert.equal(writes.at(-1), "580101b10d0c00000001a6ba", "stop frame");
-assert.equal(published.at(-1).state, "idle");
+// start/stop are not declared (the START frame did not start the device), so
+// the driver exposes no such handlers.
+assert.equal(typeof handlers.start, "undefined", "no start handler");
+assert.equal(typeof handlers.stop, "undefined", "no stop handler");
 
 await assert.rejects(() => handlers.setGrindSetting("81"), /grind setting/);
 await assert.rejects(() => handlers.setRpm(0), /rpm/);
@@ -108,8 +105,8 @@ const notifyFrame = (cmd, payload = []) =>
       .concat(payload, [0, 0]),
   ).toString("base64");
 
-await handlers.start();
-assert.equal(published.at(-1).state, "busy");
+notify(notifyFrame(0x9e39, [68, 0, 0, 0]));
+assert.equal(published.at(-1).state, "busy", "move frame → busy");
 const afterMove = published.length;
 notify(notifyFrame(0x9e39, [68, 0, 0, 0]));
 assert.equal(published.length, afterMove, "repeated move frames did not republish");
@@ -137,10 +134,15 @@ assert.match(page.headers["Content-Type"], /text\/html/, "settings page content 
 assert.match(page.body, /value="50"/, "settings page shows default grind");
 assert.match(page.body, /value="60"/, "settings page shows default rpm");
 
+const writesBeforeSave = writes.length;
 const saved = await plugin.__httpRequestHandler(
   settingsRequest("POST", { deviceId: "x" }, { grind: 30, rpm: 90 }),
 );
 assert.equal(saved.status, 200);
+assert.ok(
+  writes.length > writesBeforeSave,
+  "saving defaults sends a set frame to the connected grinder",
+);
 assert.deepEqual(JSON.parse(saved.body), { deviceId: "x", grind: 30, rpm: 90 });
 assert.equal(store.get("x"), JSON.stringify({ grind: 30, rpm: 90 }), "defaults persisted");
 assert.deepEqual(
@@ -153,6 +155,10 @@ const rejected = await plugin.__httpRequestHandler(
   settingsRequest("POST", { deviceId: "x" }, { grind: 900, rpm: 90 }),
 );
 assert.equal(rejected.status, 400, "out-of-range defaults rejected");
+const offStep = await plugin.__httpRequestHandler(
+  settingsRequest("POST", { deviceId: "x" }, { grind: 30, rpm: 75 }),
+);
+assert.equal(offStep.status, 400, "off-step rpm default rejected");
 assert.equal(
   (await plugin.__httpRequestHandler({ endpoint: "other", method: "GET", query: {} })).status,
   404,
@@ -168,16 +174,20 @@ assert.deepEqual(
   "reconnect loads persisted defaults",
 );
 handlers.disconnect();
-await assert.rejects(() => handlers.start(), /not connected/);
+await assert.rejects(() => handlers.setGrindSetting("30"), /not connected/);
 
 // Older Decaid without the `busy` state: the host rejects the publication and
 // the plugin falls back to idle for the move phase.
 {
   const fallback = [];
+  let fallbackNotify = null;
   const fallbackSession = {
     gatt: {
       discoverServices: async () => [SERVICE],
-      subscribe: async () => ({ unsubscribe: async () => {} }),
+      subscribe: async (_s, _c, cb) => {
+        fallbackNotify = cb;
+        return { unsubscribe: async () => {} };
+      },
       writeWithoutResponse: async () => {},
       onDisconnect: () => {},
     },
@@ -204,7 +214,7 @@ await assert.rejects(() => handlers.start(), /not connected/);
   await fallbackPlugin.onLoad();
   const fallbackHandlers = fallbackFactory.create({});
   await fallbackHandlers.connect(fallbackSession);
-  await fallbackHandlers.start();
+  fallbackNotify(notifyFrame(0x9e39, [0, 0, 0, 0]));
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(fallback.at(-1).state, "idle", "busy unsupported → idle fallback");
 }
@@ -217,7 +227,7 @@ await assert.rejects(() => handlers.start(), /not connected/);
   const manifest = JSON.parse(
     readFileSync(join(root, "xbloom-grinder.reaplugin/manifest.json"), "utf8"),
   );
-  assert.equal(manifest.version, "1.0.3", "manifest version bumped for the surfaces");
+  assert.equal(manifest.version, "1.1.0", "manifest version bumped for the surfaces");
   assert.ok(manifest.permissions.includes("api"), "api permission kept");
   assert.ok(manifest.permissions.includes("emit"), "emit permission declared");
   const endpoints = new Map(manifest.api.map((entry) => [entry.id, entry.type]));
@@ -226,16 +236,20 @@ await assert.rejects(() => handlers.start(), /not connected/);
   assert.equal(endpoints.get("rpm"), "http", "rpm (numpad call) is an http endpoint");
   assert.equal(endpoints.get("changed"), "websocket", "changed is a websocket endpoint");
   assert.equal(endpoints.get("device-settings"), "http", "device-settings endpoint kept");
+  for (const id of ["state", "set-grind", "mock"]) {
+    assert.equal(endpoints.get(id), "http", id + " is an http endpoint");
+  }
+  assert.ok(manifest.settings && manifest.settings.MockGrinder, "MockGrinder setting declared");
   assert.deepEqual(
     manifest.drivers[0].capabilities,
-    ["startStop", "grindSetting", "rpmControl"],
-    "driver capabilities unchanged",
+    ["grindSetting", "rpmControl"],
+    "driver capabilities (no startStop)",
   );
   assert.deepEqual(
     manifest.drivers[0].controls,
     {
       grindSetting: { kind: "numeric", min: 1, max: 80, step: 1 },
-      rpmControl: { kind: "numeric", min: 60, max: 120 },
+      rpmControl: { kind: "numeric", min: 60, max: 120, step: 10 },
     },
     "typed controls unchanged",
   );
@@ -307,8 +321,13 @@ assert.equal(hint.tile, "grind", "hint sits on the grind tile");
 assert.ok(hint.text.length > 0 && hint.text.length <= 24, "hint text within 24 characters");
 assert.deepEqual(
   hint.action,
-  { type: "stepsize", field: "grinderSetting", sizes: [1, 5] },
-  "hint carries the grind step size action, whole numbers only",
+  {
+    type: "call",
+    endpoint: "set-grind",
+    field: "setting",
+    input: { title: "Grind", unit: "", min: 1, max: 80, decimals: 0, value: 30 },
+  },
+  "hint opens the grind numpad and calls set-grind",
 );
 
 const button = surfaceOf(answer, "header-button");
@@ -331,7 +350,7 @@ assert.match(surfaceOf(answer, "header-button").text, /35/, "button text follows
 assert.equal(surfaceOf(answer, "tile-line").text, "90 rpm", "line still shows the rpm");
 
 // Moving to target is not idle, so the line is drawn active.
-await handlers.start();
+notify(notifyFrame(0x9e39, [0, 0, 0, 0]));
 assert.equal(surfaceOf(await skinAnswer(), "tile-line").active, true, "moving grinder → line active");
 
 // A notification-driven phase change updates the view and pushes.
@@ -367,7 +386,7 @@ assert.equal(
   100,
   "the line's numpad opens on the new value",
 );
-for (const bad of [59, 121, 60.5, "abc", null, {}]) {
+for (const bad of [59, 65, 121, 60.5, "abc", null, {}]) {
   const rejected = await plugin.__httpRequestHandler(rpmRequest({ rpm: bad }));
   assert.equal(rejected.status, 400, `rpm call rejects ${JSON.stringify(bad)}`);
 }
@@ -408,11 +427,11 @@ assert.equal(
 // (onDisconnect) puts it back offline.
 await handlers.connect(session);
 const beforeRpm = emitted.length;
-await handlers.setRpm(75);
+await handlers.setRpm(70);
 assert.equal(emitted.length, beforeRpm + 1, "setRpm emits changed");
 assert.equal(
   surfaceOf(await skinAnswer(), "tile-line").text,
-  "75 rpm",
+  "70 rpm",
   "setRpm follows into the live view",
 );
 onDisconnectHandler();
@@ -434,7 +453,7 @@ assert.equal(offlineRpm.status, 503, "offline rpm call is refused");
 assert.match(JSON.parse(offlineRpm.body).error, /not connected/i, "offline rpm call says why");
 assert.equal(
   surfaceOf(await skinAnswer(), "tile-line").text,
-  "75 rpm",
+  "70 rpm",
   "a refused rpm call does not move the line",
 );
 
@@ -472,7 +491,11 @@ assert.equal(uiPage.headers["Content-Security-Policy"], undefined, "no Origin/Re
 assert.match(uiPage.body, /streamline:ready/, "ui posts ready");
 assert.match(uiPage.body, /streamline:size/, "ui posts size");
 assert.match(uiPage.body, /streamline:close/, "ui posts close");
-assert.match(uiPage.body, /\/api\/v1\/grinder\/state/, "ui drives the grinder REST surface");
+assert.match(uiPage.body, /fetch\('state'\)/, "ui reads the plugin's own state");
+assert.match(uiPage.body, /\/api\/v1\/devices\//, "ui can drive Decaid's device connect");
+assert.match(uiPage.body, /api\('mock'/, "ui can toggle the mock grinder");
+assert.match(uiPage.body, /id="rpm"[^>]*step="10"/, "ui steps rpm by 10");
+assert.match(uiPage.body, /id="apply"/, "ui has an Apply button");
 assert.match(
   uiPage.body,
   /html,body\{[^}]*background:\s*transparent/,
@@ -551,9 +574,16 @@ function openPage(html, search, href) {
   const location = { search, href, assign: (url) => assigned.push(url) };
   const fetchStub = (url, init = {}) => {
     fetches.push({ url, method: init.method || "GET", body: init.body });
+    // The page reads the plugin's own `state` endpoint and posts to its action
+    // endpoints; the stub answers both shapes.
+    const body = /(^|\/)state$/.test(url)
+      ? { connected: true, state: "idle", setting: "50", rpm: 90, mock: false }
+      : {};
     return Promise.resolve({
       ok: true,
-      json: async () => ({ state: "idle", setting: "50", rpm: 90 }),
+      status: 200,
+      json: async () => body,
+      text: async () => JSON.stringify(body),
     });
   };
   const script = /<script>([\s\S]*?)<\/script>/.exec(html)[1];
@@ -601,28 +631,15 @@ assert.deepEqual(
 overlay.elementFor("grind").value = "42";
 overlay.elementFor("rpm").value = "100";
 overlay.fetches.length = 0;
-overlay.elementFor("start").click();
+overlay.elementFor("apply").click();
 await flush();
 assert.deepEqual(
-  overlay.fetches.map((call) => call.method + " " + call.url).slice(0, 3),
-  [
-    "PUT /api/v1/grinder/setting",
-    "PUT /api/v1/grinder/rpm",
-    "PUT /api/v1/grinder/state/grinding",
-  ],
-  "start stores grind and rpm before grinding",
+  overlay.fetches.map((call) => call.method + " " + call.url).slice(0, 2),
+  ["POST set-grind", "POST rpm"],
+  "apply sends grind and rpm",
 );
-assert.equal(overlay.fetches[0].body, JSON.stringify({ setting: "42" }), "setting body");
+assert.equal(overlay.fetches[0].body, JSON.stringify({ setting: 42 }), "setting body");
 assert.equal(overlay.fetches[1].body, JSON.stringify({ rpm: 100 }), "rpm body");
-
-overlay.fetches.length = 0;
-overlay.elementFor("stop").click();
-await flush();
-assert.deepEqual(
-  overlay.fetches.map((call) => call.method + " " + call.url).slice(0, 1),
-  ["PUT /api/v1/grinder/state/idle"],
-  "stop",
-);
 
 overlay.elementFor("close").click();
 assert.deepEqual(overlay.posts.at(-1), { type: "streamline:close" }, "embedded close posts close");
@@ -654,5 +671,218 @@ const bad = openPage(
 await flush();
 bad.elementFor("close").click();
 assert.deepEqual(bad.assigned, ["/"], "a non-http returnTo is not followed");
+
+// --- Storage-request fixes -----------------------------------------------
+
+// Overlapping reads of the same key both settle: connect() loads the stored
+// defaults while a settings read hits the same key, so a single-slot map would
+// strand the connect read forever.
+{
+  let capturedFactory = null;
+  const tried = [];
+  const host = {
+    log: () => {},
+    emit: () => {},
+    // Respond only when the test says so.
+    storage: (cmd) => { if (cmd.type === "read") tried.push(cmd.key); },
+    devices: { bindDriver: async (_id, f) => { capturedFactory = f; } },
+  };
+  const p = createPlugin(host);
+  await p.onLoad();
+  const h = capturedFactory.create({ id: "dup" });
+  const connecting = h.connect(session); // issues storageRead("dup")
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const settingsPending = p.__httpRequestHandler({
+    requestId: "dup-settings",
+    endpoint: "device-settings",
+    method: "GET",
+    headers: {},
+    query: { deviceId: "dup" },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(
+    tried.filter((key) => key === "dup").length >= 2,
+    "two reads of the same key are in flight",
+  );
+  p.onEvent({ name: "storageRead", payload: { key: "dup", value: null } });
+  assert.equal((await settingsPending).status, 200, "the settings read settled");
+  await connecting; // would hang without the per-key waiter queue
+  assert.ok(true, "the overlapping connect read settled too");
+  p.onUnload();
+}
+
+// A write whose confirmation never arrives is settled by onUnload, so an
+// in-flight settings POST cannot hang across a reload.
+{
+  let p = null;
+  let capturedFactory = null;
+  const host = {
+    log: () => {},
+    emit: () => {},
+    storage: (cmd) => {
+      if (cmd.type === "read") {
+        queueMicrotask(() =>
+          p.onEvent({ name: "storageRead", payload: { key: cmd.key, value: null } }),
+        );
+      }
+      // writes are never confirmed
+    },
+    devices: { bindDriver: async (_id, f) => { capturedFactory = f; } },
+  };
+  p = createPlugin(host);
+  await p.onLoad();
+  const h = capturedFactory.create({ id: "w" });
+  await h.connect(session);
+  const pending = p.__httpRequestHandler({
+    requestId: "w-settings",
+    endpoint: "device-settings",
+    method: "POST",
+    headers: {},
+    query: { deviceId: "w" },
+    body: { grind: 20, rpm: 80 },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  p.onUnload();
+  assert.equal((await pending).status, 200, "the pending write settled on unload");
+}
+
+// --- Mock grinder ---------------------------------------------------------
+
+// The toggle drives the real driver through a fake session, so the dashboard
+// surfaces report a connected, controllable grinder without hardware.
+{
+  let mPlugin = null;
+  let capturedFactory = null;
+  const mockStore = new Map();
+  const mockHost = {
+    log: () => {},
+    emit: () => {},
+    storage: (cmd) => {
+      if (cmd.type === "read") {
+        const value = mockStore.has(cmd.key) ? mockStore.get(cmd.key) : null;
+        queueMicrotask(() =>
+          mPlugin.onEvent({ name: "storageRead", payload: { key: cmd.key, value } }),
+        );
+      } else {
+        mockStore.set(cmd.key, cmd.data);
+        queueMicrotask(() =>
+          mPlugin.onEvent({ name: "storageWrite", payload: cmd.data }),
+        );
+      }
+    },
+    devices: { bindDriver: async (_id, f) => { capturedFactory = f; } },
+  };
+  mPlugin = createPlugin(mockHost);
+  await mPlugin.onLoad();
+  assert.ok(capturedFactory, "mock host bound the driver");
+
+  const req = (endpoint, body, method = "POST") => ({
+    requestId: endpoint, endpoint, method, headers: {}, body, query: {},
+  });
+  const state = async () =>
+    JSON.parse((await mPlugin.__httpRequestHandler(req("state", undefined, "GET"))).body);
+
+  assert.equal((await state()).mock, false, "mock is off by default");
+  assert.equal((await state()).connected, false, "no grinder without the mock");
+
+  const enabled = await mPlugin.__httpRequestHandler(req("mock", { on: true }));
+  assert.equal(enabled.status, 200, "mock toggle accepted");
+  assert.deepEqual(JSON.parse(enabled.body), { mock: true }, "mock toggle answer");
+  let view = await state();
+  assert.equal(view.mock, true, "mock reports on");
+  assert.equal(view.connected, true, "mock reports connected");
+  assert.equal(mockStore.get("mock"), "1", "mock flag persisted");
+
+  const skinOf = async () =>
+    JSON.parse(
+      (await mPlugin.__httpRequestHandler({
+        requestId: "skin", endpoint: "skin", method: "GET", headers: {}, query: {},
+      })).body,
+    ).surfaces.find((surface) => surface.kind === "header-button").text;
+  assert.doesNotMatch(await skinOf(), /offline/i, "skin shows the mock grinder connected");
+
+  await mPlugin.__httpRequestHandler(req("set-grind", { setting: 33 }));
+  await mPlugin.__httpRequestHandler(req("rpm", { rpm: 110 }));
+  view = await state();
+  assert.equal(view.setting, "33", "mock set-grind applied");
+  assert.equal(view.rpm, 110, "mock rpm applied");
+
+  const off = await mPlugin.__httpRequestHandler(req("mock", { on: false }));
+  assert.deepEqual(JSON.parse(off.body), { mock: false }, "mock toggle off");
+  view = await state();
+  assert.equal(view.mock, false, "mock reports off");
+  assert.equal(view.connected, false, "mock off → disconnected");
+  assert.equal(mockStore.get("mock"), "0", "mock off persisted");
+
+  // A real binding supersedes a running mock.
+  await mPlugin.__httpRequestHandler(req("mock", { on: true }));
+  assert.equal((await state()).mock, true, "mock re-enabled");
+  capturedFactory.create({ id: "real-device" });
+  assert.equal((await state()).mock, false, "a real binding stops the mock");
+}
+
+// Turning the mock off hands the endpoints back to the real driver, so a mock
+// cycle does not leave the plugin talking to a retired mock.
+{
+  let p = null;
+  let factory = null;
+  const store = new Map();
+  const realWrites = [];
+  const realSession = {
+    gatt: {
+      discoverServices: async () => [SERVICE],
+      subscribe: async () => ({ unsubscribe: async () => {} }),
+      writeWithoutResponse: async (_s, _c, data) =>
+        realWrites.push(Buffer.from(data, "base64").toString("hex")),
+      onDisconnect: () => {},
+    },
+    publish: async () => {},
+    reportDisconnected: async () => {},
+  };
+  const host = {
+    log: () => {},
+    emit: () => {},
+    storage: (cmd) => {
+      if (cmd.type === "read") {
+        const value = store.has(cmd.key) ? store.get(cmd.key) : null;
+        queueMicrotask(() =>
+          p.onEvent({ name: "storageRead", payload: { key: cmd.key, value } }),
+        );
+      } else {
+        store.set(cmd.key, cmd.data);
+        queueMicrotask(() =>
+          p.onEvent({ name: "storageWrite", payload: cmd.data }),
+        );
+      }
+    },
+    devices: { bindDriver: async (_id, f) => { factory = f; } },
+  };
+  const call = (endpoint, body) =>
+    p.__httpRequestHandler({
+      requestId: endpoint, endpoint, method: "POST", headers: {}, body, query: {},
+    });
+  p = createPlugin(host);
+  await p.onLoad();
+  const real = factory.create({ id: "real-1" });
+  await real.connect(realSession);
+  await call("set-grind", { setting: 20 });
+  assert.ok(realWrites.length > 0, "the real driver receives the set frame");
+
+  await call("mock", { on: true });
+  const mockWrites = realWrites.length;
+  await call("set-grind", { setting: 21 });
+  assert.equal(realWrites.length, mockWrites, "while mocked, the real driver is untouched");
+
+  await call("mock", { on: false });
+  const afterMock = JSON.parse(
+    (await p.__httpRequestHandler({ endpoint: "state", method: "GET", headers: {}, query: {} })).body,
+  );
+  assert.equal(afterMock.connected, true, "live shows the real grinder again after the mock");
+  await call("set-grind", { setting: 22 });
+  assert.ok(
+    realWrites.length > mockWrites,
+    "after the mock is off, the real driver receives frames again",
+  );
+}
 
 console.log("check_plugin: OK (BLE writes match the observed device behavior)");
